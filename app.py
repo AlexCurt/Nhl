@@ -4,6 +4,8 @@ Modele : buts attendus = tirs/match x % de reussite x forme x gardien adverse
 x defense adverse x domicile/exterieur. Proba de marquer = 1 - exp(-buts attendus).
 Les cotes Winamax sont saisies a la main dans le tableau.
 """
+import base64
+import io
 import math
 import unicodedata
 from datetime import datetime
@@ -209,6 +211,7 @@ def build_rows(team, skaters, prior, n, is_home, opp_sv, opp_def):
 
         rows.append({
             "Joue": True,
+            "_id": s["playerId"],
             "Joueur": name_of(s),
             "Équipe": team,
             "Tirs/match": round(spg, 2),
@@ -222,8 +225,131 @@ def build_rows(team, skaters, prior, n, is_home, opp_sv, opp_def):
     return rows
 
 
+# ---------------------------------------------------------------- sauvegarde GitHub (branche 'data')
+DATA_BRANCH = "data"
+
+
+def gh_conf():
+    try:
+        return st.secrets.get("GITHUB_TOKEN"), st.secrets.get("GITHUB_REPO")
+    except Exception:
+        return None, None
+
+
+def _gh(token, raw=False):
+    return {"Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github.raw+json" if raw else "application/vnd.github+json"}
+
+
+def gh_ensure_branch(token, repo):
+    base = f"https://api.github.com/repos/{repo}"
+    r = requests.get(f"{base}/git/ref/heads/{DATA_BRANCH}", headers=_gh(token), timeout=20)
+    if r.status_code == 200:
+        return
+    r = requests.get(f"{base}/git/ref/heads/main", headers=_gh(token), timeout=20)
+    r.raise_for_status()
+    sha = r.json()["object"]["sha"]
+    r = requests.post(f"{base}/git/refs", headers=_gh(token), timeout=20,
+                      json={"ref": f"refs/heads/{DATA_BRANCH}", "sha": sha})
+    r.raise_for_status()
+
+
+def gh_save(path, text, token, repo):
+    gh_ensure_branch(token, repo)
+    url = f"https://api.github.com/repos/{repo}/contents/{path}"
+    r = requests.get(url, headers=_gh(token), params={"ref": DATA_BRANCH}, timeout=20)
+    body = {"message": f"predictions {path}", "branch": DATA_BRANCH,
+            "content": base64.b64encode(text.encode("utf-8")).decode()}
+    if r.status_code == 200:
+        body["sha"] = r.json()["sha"]
+    r = requests.put(url, headers=_gh(token), json=body, timeout=20)
+    r.raise_for_status()
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def gh_load_predictions(token, repo):
+    url = f"https://api.github.com/repos/{repo}/contents/predictions"
+    r = requests.get(url, headers=_gh(token), params={"ref": DATA_BRANCH}, timeout=20)
+    if r.status_code == 404:
+        return pd.DataFrame()
+    r.raise_for_status()
+    frames = []
+    for f in r.json():
+        if f["name"].endswith(".csv"):
+            rr = requests.get(f["url"], headers=_gh(token, raw=True), params={"ref": DATA_BRANCH}, timeout=20)
+            rr.raise_for_status()
+            frames.append(pd.read_csv(io.StringIO(rr.text)))
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def boxscore_goals(game_id):
+    """{playerId: buts} si le match est termine, sinon None."""
+    d = get_json(f"/gamecenter/{game_id}/boxscore")
+    if d.get("gameState") not in ("OFF", "FINAL"):
+        return None
+    out = {}
+    for side in ("awayTeam", "homeTeam"):
+        grp = d.get("playerByGameStats", {}).get(side, {})
+        for pos in ("forwards", "defense"):
+            for pl in grp.get(pos, []):
+                out[pl["playerId"]] = pl.get("goals", 0)
+    return out
+
+
+def render_bilan():
+    token, repo = gh_conf()
+    if not (token and repo):
+        st.info("Le suivi nécessite GITHUB_TOKEN et GITHUB_REPO dans les Secrets (voir les instructions).")
+        return
+    try:
+        df = gh_load_predictions(token, repo)
+    except Exception as e:
+        st.warning(f"Lecture des prédictions impossible : {e}")
+        return
+    if df.empty:
+        st.info("Aucune prédiction enregistrée pour l'instant. Utilise le bouton « Enregistrer » avant les matchs.")
+        return
+    goals = {}
+    for gid in df["game_id"].unique():
+        try:
+            goals[gid] = boxscore_goals(int(gid))
+        except Exception:
+            goals[gid] = None
+    df["but"] = [
+        (1 if (goals.get(r.game_id) or {}).get(int(r.player_id), 0) > 0 else 0)
+        if goals.get(r.game_id) is not None else None
+        for r in df.itertuples()
+    ]
+    done = df.dropna(subset=["but"]).copy()
+    st.write(f"{len(df)} prédictions enregistrées, {len(done)} sur des matchs terminés.")
+    if done.empty:
+        return
+    y = done["but"].astype(float)
+
+    def brier(col, sub, yy):
+        return float(((sub[col] / 100 - yy) ** 2).mean())
+
+    mk = done.dropna(subset=["p_mkt"])
+    rows = [{"Source": "Modèle seul", "Brier": round(brier("p_model", mk, mk["but"]), 4)},
+            {"Source": "Marché US corrigé", "Brier": round(brier("p_mkt", mk, mk["but"]), 4)},
+            {"Source": "Proba finale", "Brier": round(brier("p_final", mk, mk["but"]), 4)}]
+    st.markdown("**Score de Brier** (plus bas = meilleur), sur les joueurs avec cote US")
+    st.dataframe(pd.DataFrame(rows), hide_index=True)
+
+    done["Tranche"] = pd.cut(done["p_final"], [0, 15, 25, 35, 100], labels=["<15 %", "15-25 %", "25-35 %", ">35 %"])
+    cal = done.groupby("Tranche", observed=True).agg(
+        Prédictions=("but", "size"), Proba_moyenne=("p_final", "mean"), Taux_réel=("but", "mean"))
+    cal["Taux_réel"] = (cal["Taux_réel"] * 100).round(1)
+    cal["Proba_moyenne"] = cal["Proba_moyenne"].round(1)
+    st.markdown("**Calibration** : la proba annoncée doit ressembler au taux réel")
+    st.dataframe(cal)
+    if len(done) < 300:
+        st.caption("Échantillon encore petit (< 300) : ne tire aucune conclusion ferme avant plusieurs semaines.")
+
+
 # ---------------------------------------------------------------- interface
-def render_game(g, season, prior, ga_map, league_pg, n, bankroll):
+def render_game(g, season, prior, ga_map, league_pg, n, bankroll, margin, w_model, edge, day):
     away, home = g["awayTeam"]["abbrev"], g["homeTeam"]["abbrev"]
     try:
         start = datetime.fromisoformat(g["startTimeUTC"].replace("Z", "+00:00"))
@@ -263,14 +389,12 @@ def render_game(g, season, prior, ga_map, league_pg, n, bankroll):
 
     df = pd.DataFrame(rows).sort_values("Proba but %", ascending=False).reset_index(drop=True)
 
-    # cotes americaines (optionnel)
+    # ---- cotes americaines (optionnel)
     key = odds_key()
     us = {}
     if key:
         def names(t):
-            return tuple(
-                (g[t].get(k) or {}).get("default", "") for k in ("commonName", "placeName")
-            )
+            return tuple((g[t].get(k) or {}).get("default", "") for k in ("commonName", "placeName"))
         try:
             us, left = fetch_us_odds(names("awayTeam"), names("homeTeam"), key)
             if us:
@@ -281,47 +405,84 @@ def render_game(g, season, prior, ga_map, league_pg, n, bankroll):
             st.warning(f"Cotes US indisponibles : {e}")
     else:
         st.caption("Ajoute ODDS_API_KEY dans Secrets pour afficher les cotes américaines.")
-    df["Cote US moy."] = df["Joueur"].map(lambda n: round(us[norm(n)]["avg"], 2) if norm(n) in us else None)
-    df["Meilleure US"] = df["Joueur"].map(lambda n: round(us[norm(n)]["best"], 2) if norm(n) in us else None)
-    df["Proba US %"] = (100 / df["Cote US moy."]).round(1)
-    df["Écart modèle-US"] = (df["Proba but %"] - df["Proba US %"]).round(1)
-    df = df[["Joue", "Joueur", "Équipe", "Tirs/match", "% réussite", "Forme", "Buts attendus",
-             "Proba but %", "Cote juste", "Cote US moy.", "Meilleure US", "Proba US %",
-             "Écart modèle-US", "Cote Winamax"]]
-    st.markdown("**1. Saisis la cote Winamax « Buteur » des joueurs qui t'intéressent** (et décoche ceux qui ne jouent pas)")
-    edited = st.data_editor(
-        df, hide_index=True, key=f"ed_{g['id']}",
-        disabled=[c for c in df.columns if c not in ("Joue", "Cote Winamax")],
-        column_config={"Cote Winamax": st.column_config.NumberColumn(min_value=1.01, step=0.05, format="%.2f")},
-    )
+    df["Cote US moy."] = df["Joueur"].map(lambda x: round(us[norm(x)]["avg"], 2) if norm(x) in us else None)
+    df["Meilleure US"] = df["Joueur"].map(lambda x: round(us[norm(x)]["best"], 2) if norm(x) in us else None)
 
-    res = edited[(edited["Joue"]) & (edited["Cote Winamax"].fillna(0) > 1)].copy()
-    st.markdown("**2. Résultat**")
-    if res.empty:
-        st.info("Saisis au moins une cote pour voir la value.")
-        return
-    p = res["Proba but %"] / 100
-    res["Value %"] = ((p * res["Cote Winamax"] - 1) * 100).round(1)
-    kelly = ((p * res["Cote Winamax"] - 1) / (res["Cote Winamax"] - 1)).clip(lower=0) * KELLY_FRACTION
-    res["Mise suggérée (€)"] = (kelly * bankroll).round(2)
-    res = res.sort_values("Value %", ascending=False)
+    # ---- proba marche corrigee de la marge, puis proba finale (melange modele / marche)
+    df["Proba marché %"] = (100 / df["Cote US moy."] / (1 + margin)).round(1)
+    blend = w_model * df["Proba but %"] + (1 - w_model) * df["Proba marché %"]
+    df["Proba finale %"] = blend.where(df["Proba marché %"].notna(), df["Proba but %"]).round(1)
+    df["Cote juste"] = (100 / df["Proba finale %"]).round(2)
+    df["Cote Winamax min"] = ((1 + edge) * 100 / df["Proba finale %"]).round(2)
+    df["Value si cote = meilleure US %"] = ((df["Proba finale %"] / 100 * df["Meilleure US"] - 1) * 100).round(1)
+
+    # ---- 1. shortlist
+    st.markdown("**À regarder sur Winamax** : si la cote Winamax du joueur est ≥ « cote min », c'est du value selon l'outil")
+    short = df.sort_values("Value si cote = meilleure US %", ascending=False, na_position="last").head(6)
     st.dataframe(
-        res[["Joueur", "Équipe", "Proba but %", "Cote juste", "Cote Winamax", "Value %", "Mise suggérée (€)"]],
+        short[["Joueur", "Équipe", "Proba finale %", "Cote Winamax min", "Meilleure US",
+               "Value si cote = meilleure US %"]],
         hide_index=True,
     )
-    st.caption("Value > 0 : ta probabilité estimée dépasse celle de la cote. "
-               "Mise = 1/4 de Kelly. Vérifie toujours compos, blessures et gardien confirmé avant de jouer.")
+    st.caption("« Value si cote = meilleure US » suppose que Winamax offre la meilleure cote américaine. "
+               f"Marge du marché supposée : {margin * 100:.0f} %. Poids du modèle : {w_model * 100:.0f} %.")
+
+    # ---- 2. enregistrement des predictions
+    out = pd.DataFrame({
+        "date": day.isoformat(), "game_id": g["id"], "player_id": df["_id"], "joueur": df["Joueur"],
+        "equipe": df["Équipe"], "p_model": df["Proba but %"], "p_mkt": df["Proba marché %"],
+        "p_final": df["Proba finale %"], "best_us": df["Meilleure US"], "avg_us": df["Cote US moy."],
+    })
+    token, repo = gh_conf()
+    if token and repo:
+        if st.button("💾 Enregistrer les prédictions de ce match", key=f"save_{g['id']}"):
+            try:
+                gh_save(f"predictions/{day.isoformat()}_{g['id']}.csv", out.to_csv(index=False), token, repo)
+                gh_load_predictions.clear()
+                st.success("Enregistré. Le bilan se met à jour après la fin du match.")
+            except Exception as e:
+                st.error(f"Échec de l'enregistrement : {e}")
+    else:
+        st.download_button("⬇️ Télécharger les prédictions (CSV)", out.to_csv(index=False),
+                           file_name=f"predictions_{day.isoformat()}_{g['id']}.csv", key=f"dl_{g['id']}")
+
+    # ---- 3. detail + saisie optionnelle
+    with st.expander("Détail par joueur et saisie d'une cote Winamax (optionnel)"):
+        view = df[["Joue", "Joueur", "Équipe", "Proba but %", "Proba marché %", "Proba finale %",
+                   "Cote juste", "Cote Winamax min", "Cote US moy.", "Meilleure US",
+                   "Tirs/match", "% réussite", "Forme", "Buts attendus"]].copy()
+        view["Cote Winamax"] = None
+        edited = st.data_editor(
+            view, hide_index=True, key=f"ed_{g['id']}",
+            disabled=[c for c in view.columns if c not in ("Joue", "Cote Winamax")],
+            column_config={"Cote Winamax": st.column_config.NumberColumn(min_value=1.01, step=0.05, format="%.2f")},
+        )
+        res = edited[(edited["Joue"]) & (edited["Cote Winamax"].fillna(0) > 1)].copy()
+        if not res.empty:
+            p = res["Proba finale %"] / 100
+            res["Value %"] = ((p * res["Cote Winamax"] - 1) * 100).round(1)
+            kelly = ((p * res["Cote Winamax"] - 1) / (res["Cote Winamax"] - 1)).clip(lower=0) * KELLY_FRACTION
+            res["Mise suggérée (€)"] = (kelly * bankroll).round(2)
+            st.dataframe(
+                res.sort_values("Value %", ascending=False)[
+                    ["Joueur", "Proba finale %", "Cote juste", "Cote Winamax", "Value %", "Mise suggérée (€)"]],
+                hide_index=True,
+            )
+    st.caption("Vérifie toujours compos, blessures et gardien confirmé avant de jouer.")
 
 
 def main():
     check_password()
     st.title("🏒 NHL – Buteurs value")
-    st.caption("V1 – modèle simple, à calibrer. Aucune garantie de gain.")
+    st.caption("V2 – modèle + marché US. Outil d'aide à la décision, aucune garantie de gain.")
 
     tz = ZoneInfo("America/New_York")
     day = st.sidebar.date_input("Date NHL (heure US)", value=datetime.now(tz).date())
     bankroll = st.sidebar.number_input("Bankroll (€)", min_value=0.0, value=100.0, step=10.0)
     n = st.sidebar.slider("Joueurs analysés par équipe", 4, 14, 8)
+    margin = st.sidebar.slider("Marge estimée du marché US (%)", 0, 20, 8) / 100
+    w_model = st.sidebar.slider("Poids du modèle dans la proba finale (%)", 0, 100, 50) / 100
+    edge = st.sidebar.slider("Avantage minimum exigé (%)", 0, 20, 5) / 100
     st.sidebar.markdown("**Convertisseur cote américaine**")
     am = st.sidebar.number_input("Cote US (ex. +150 ou -200)", value=150, step=5)
     if abs(am) >= 100:
@@ -329,6 +490,11 @@ def main():
     if st.sidebar.button("Rafraîchir les données"):
         st.cache_data.clear()
         st.rerun()
+
+    page = st.radio("Page", ["Matchs du jour", "Bilan"], horizontal=True, label_visibility="collapsed")
+    if page == "Bilan":
+        render_bilan()
+        return
 
     season, prior = season_ids(day)
     try:
@@ -344,7 +510,7 @@ def main():
     tabs = st.tabs([f"{g['awayTeam']['abbrev']} @ {g['homeTeam']['abbrev']}" for g in games])
     for tab, g in zip(tabs, games):
         with tab:
-            render_game(g, season, prior, ga_map, league_pg, n, bankroll)
+            render_game(g, season, prior, ga_map, league_pg, n, bankroll, margin, w_model, edge, day)
 
 
 main()
