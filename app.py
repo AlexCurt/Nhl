@@ -5,6 +5,7 @@ x defense adverse x domicile/exterieur. Proba de marquer = 1 - exp(-buts attendu
 Les cotes Winamax sont saisies a la main dans le tableau.
 """
 import math
+import unicodedata
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -13,6 +14,7 @@ import requests
 import streamlit as st
 
 API = "https://api-web.nhle.com/v1"
+ODDS_API = "https://api.the-odds-api.com/v4"
 
 # --- Parametres du modele (a ajuster) ---
 LEAGUE_SV = 0.905        # % d'arrets moyen NHL
@@ -96,6 +98,57 @@ def league_context():
             tot_g += g
             tot_gp += gp
     return ga, (tot_g / tot_gp if tot_gp else 3.0)
+
+
+# ---------------------------------------------------------------- cotes US
+def american_to_decimal(a):
+    """+150 -> 2.50 ; -200 -> 1.50"""
+    a = float(a)
+    return 1 + a / 100 if a > 0 else 1 + 100 / abs(a)
+
+
+def norm(name):
+    s = unicodedata.normalize("NFKD", name or "").encode("ascii", "ignore").decode().lower()
+    return " ".join("".join(c for c in s if c.isalnum() or c == " ").split())
+
+
+def odds_key():
+    try:
+        return st.secrets.get("ODDS_API_KEY")
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_us_odds(away_names, home_names, key):
+    """Cotes 'buteur a tout moment' des bookmakers US, en decimal.
+    Retourne ({nom_normalise: {'avg','best','n'}}, credits_restants)."""
+    r = requests.get(f"{ODDS_API}/sports/icehockey_nhl/events", params={"apiKey": key}, timeout=20)
+    r.raise_for_status()
+    ev = None
+    for e in r.json():
+        h, a = e.get("home_team", "").lower(), e.get("away_team", "").lower()
+        if any(n.lower() in h for n in home_names if n) and any(n.lower() in a for n in away_names if n):
+            ev = e
+            break
+    if not ev:
+        return {}, None
+    r = requests.get(
+        f"{ODDS_API}/sports/icehockey_nhl/events/{ev['id']}/odds",
+        params={"apiKey": key, "regions": "us", "markets": "player_goal_scorer_anytime", "oddsFormat": "decimal"},
+        timeout=20,
+    )
+    r.raise_for_status()
+    prices = {}
+    for bk in r.json().get("bookmakers", []):
+        for m in bk.get("markets", []):
+            if m.get("key") != "player_goal_scorer_anytime":
+                continue
+            for o in m.get("outcomes", []):
+                if o.get("name") in ("Yes", "Over") and o.get("description") and o.get("price"):
+                    prices.setdefault(norm(o["description"]), []).append(float(o["price"]))
+    out = {k: {"avg": sum(v) / len(v), "best": max(v), "n": len(v)} for k, v in prices.items()}
+    return out, r.headers.get("x-requests-remaining")
 
 
 # ---------------------------------------------------------------- modele
@@ -209,6 +262,32 @@ def render_game(g, season, prior, ga_map, league_pg, n, bankroll):
         return
 
     df = pd.DataFrame(rows).sort_values("Proba but %", ascending=False).reset_index(drop=True)
+
+    # cotes americaines (optionnel)
+    key = odds_key()
+    us = {}
+    if key:
+        def names(t):
+            return tuple(
+                (g[t].get(k) or {}).get("default", "") for k in ("commonName", "placeName")
+            )
+        try:
+            us, left = fetch_us_odds(names("awayTeam"), names("homeTeam"), key)
+            if us:
+                st.caption(f"Cotes US chargées ({len(us)} joueurs). Crédits API restants : {left}")
+            else:
+                st.caption("Cotes US : aucun marché buteur trouvé pour ce match (pas encore publié ?).")
+        except Exception as e:
+            st.warning(f"Cotes US indisponibles : {e}")
+    else:
+        st.caption("Ajoute ODDS_API_KEY dans Secrets pour afficher les cotes américaines.")
+    df["Cote US moy."] = df["Joueur"].map(lambda n: round(us[norm(n)]["avg"], 2) if norm(n) in us else None)
+    df["Meilleure US"] = df["Joueur"].map(lambda n: round(us[norm(n)]["best"], 2) if norm(n) in us else None)
+    df["Proba US %"] = (100 / df["Cote US moy."]).round(1)
+    df["Écart modèle-US"] = (df["Proba but %"] - df["Proba US %"]).round(1)
+    df = df[["Joue", "Joueur", "Équipe", "Tirs/match", "% réussite", "Forme", "Buts attendus",
+             "Proba but %", "Cote juste", "Cote US moy.", "Meilleure US", "Proba US %",
+             "Écart modèle-US", "Cote Winamax"]]
     st.markdown("**1. Saisis la cote Winamax « Buteur » des joueurs qui t'intéressent** (et décoche ceux qui ne jouent pas)")
     edited = st.data_editor(
         df, hide_index=True, key=f"ed_{g['id']}",
@@ -243,6 +322,10 @@ def main():
     day = st.sidebar.date_input("Date NHL (heure US)", value=datetime.now(tz).date())
     bankroll = st.sidebar.number_input("Bankroll (€)", min_value=0.0, value=100.0, step=10.0)
     n = st.sidebar.slider("Joueurs analysés par équipe", 4, 14, 8)
+    st.sidebar.markdown("**Convertisseur cote américaine**")
+    am = st.sidebar.number_input("Cote US (ex. +150 ou -200)", value=150, step=5)
+    if abs(am) >= 100:
+        st.sidebar.write(f"= **{american_to_decimal(am):.2f}** en décimal (proba {100 / american_to_decimal(am):.1f} %)")
     if st.sidebar.button("Rafraîchir les données"):
         st.cache_data.clear()
         st.rerun()
